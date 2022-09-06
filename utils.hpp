@@ -1,74 +1,78 @@
 #pragma once
 
-#include <memory>
-#include <algorithm>
+#include <pro.h>
 
 //----------------------------------------------------------------------------------
-ea_t get_selection_range(TWidget* widget, ea_t* end_ea = nullptr, int widget_type = BWN_DISASM)
+struct hexrays_collect_cinsn_from_ea : public hexrays_ctreeparent_visitor_t
 {
-    ea_t ea1 = BADADDR, ea2 = BADADDR;
-    do
+    cinsnptrvec_t* marked_insn = nullptr;
+    eanodes_t* marked_ea = nullptr;
+
+    hexrays_collect_cinsn_from_ea(cfunc_t* cfunc, eanodes_t* marked_ea, cinsnptrvec_t* marked_insn) :
+        marked_ea(marked_ea), marked_insn(marked_insn)
     {
-        if (widget == nullptr || (widget_type != -1 && get_widget_type(widget) != widget_type))
-            break;
-
-        if (!read_range_selection(widget, &ea1, &ea2))
-        {
-            ea1 = get_screen_ea();
-
-            if (ea1 == BADADDR)
-                break;
-            insn_t inst;
-            ea2 = (decode_insn(&inst, ea1) == 0) ? ea1 + 1 : ea1 + inst.size;
-        }
-    } while (false);
-    if (end_ea != nullptr)
-        *end_ea = ea2;
-
-    return ea1;
-}
-
-//----------------------------------------------------------------------------------
-inline cinsn_t* hexrays_get_stmt_insn(cfunc_t* cfunc, citem_t* ui_item)
-{
-    auto func_body = &cfunc->body;
-
-    citem_t* item = ui_item;
-    citem_t* stmt_item;
-
-    // Get the top level statement from this item
-    for (stmt_item = item; item != nullptr && item->is_expr(); item = func_body->find_parent_of(item))
-        stmt_item = item;
-
-    // ...then the actual instruction item
-    if (stmt_item->is_expr())
-        stmt_item = func_body->find_parent_of(stmt_item);
-
-    return (cinsn_t*)stmt_item;
-}
-
-//----------------------------------------------------------------------------------
-inline bool hexrays_get_stmt_block_pos(
-    cfunc_t* cfunc,
-    citem_t* stmt_item,
-    cblock_t** p_cblock,
-    cblock_t::iterator* p_pos)
-{
-    auto func_body = &cfunc->body;
-    cinsn_t* cblock_insn = (cinsn_t*)func_body->find_parent_of(stmt_item);
-    if (cblock_insn == nullptr || cblock_insn->op != cit_block)
-        return false;
-
-    cblock_t* cblock = cblock_insn->cblock;
-
-    for (auto p = cblock->begin(); p != cblock->end(); ++p)
-    {
-        if (*p == *((cinsn_t*)stmt_item))
-        {
-            *p_pos = p;
-            *p_cblock = cblock;
-            return true;
-        }
+        apply_to(&cfunc->body, nullptr);
     }
-    return false;
-}
+
+    int idaapi visit_insn(cinsn_t* ins) override
+    {
+        hexrays_ctreeparent_visitor_t::visit_insn(ins);
+        if (ins->op != cit_block && marked_ea->contains(ins->ea))
+            marked_insn->push_back(ins);
+
+        return 0;
+    }
+};
+
+//----------------------------------------------------------------------------------
+struct codeitem_t
+{
+    ea_t ea = BADADDR;
+    bytevec_t bytes;
+    qstring cmt, rep_cmt;
+
+    codeitem_t()                           { }
+    codeitem_t(ea_t ea)                    { copy(ea, *this); }
+
+    const size_t size() const              { return bytes.size(); }
+    bool copy(ea_t ea)                     { return copy(ea, *this); }
+
+    const bool operator !() const          { return ea == BADADDR; }
+    // Since we filter out instructions that break basic blocks (contain addresses) then
+    // we assume it is safe to compare instruction bytes.
+    bool operator==(const codeitem_t& rhs) { return bytes == rhs.bytes; }
+
+    codeitem_t& operator =(const ea_t src)
+    {
+        copy(src);
+        return *this;
+    }
+
+    static bool copy(ea_t ea, codeitem_t& _this)
+    {
+        insn_t inst;
+        if (!decode_insn(&inst, ea) || is_basic_block_end(inst, true))
+            return false;
+
+        auto sz = inst.size;
+
+        get_cmt(&_this.cmt, ea, false);
+        get_cmt(&_this.rep_cmt, ea, true);
+
+        _this.bytes.resize(sz);
+        get_bytes(_this.bytes.begin(), sz, ea);
+
+        _this.ea = ea;
+
+        return true;
+    }
+
+    ea_t paste(ea_t dst_ea) const
+    {
+        patch_bytes(dst_ea, bytes.begin(), bytes.size());
+        set_cmt(dst_ea, cmt.c_str(), false);
+        set_cmt(dst_ea, rep_cmt.c_str(), true);
+        dst_ea += ea_t(bytes.size());
+        return dst_ea;
+    }
+};
